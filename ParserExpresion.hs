@@ -1,6 +1,8 @@
-module ParserExpresion where
-
-
+module ParserExpresion(
+  parseExp,
+  evalExp
+)
+where
 import Text.Parsec
     ( 
       spaces,
