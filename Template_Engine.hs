@@ -1,52 +1,104 @@
 import Text.ParserCombinators.Parsec
 import ParserExpresion (parseExp,evalExp)
 import Control.Arrow (Arrow(first))
-data TemplateElement = TextElement String | VariableElement String | IfElement String [TemplateElement] | LoopElement String [TemplateElement] deriving Show
+import Data.String (IsString)
+import Text.Parsec (parse)
+import Data.List (isPrefixOf, elemIndex,tails)
+import Data.String (IsString)
+import Language.Haskell.TH (Strict)
+import Numeric.Natural
+import Data.Maybe (maybeToList)
+import Distribution.Simple.InstallDirs (substituteInstallDirTemplates)
+import Data.Array.IArray (Ix(index))
+import Data.ByteString (split)
 
--- Parser para elementos de plantilla
-templateParser :: Parser [TemplateElement]
-templateParser = many templateElementParser
+data TemplateElement =
+    TextElement String
+    |VariableElement String
+    |IfElement String String
+    deriving (Eq,Show)
 
-templateElementParser :: Parser TemplateElement
-templateElementParser = try ifParser <|> try loopParser <|> try textParser <|> try variableParser 
+type Template = [TemplateElement]
+-- Parser Template Element
+parser ::String -> Template
+parser  text
+  |parseBVar text =
+      let (var,rest) = parseVar text
+      in VariableElement var : parser  rest
+  |parseBIf text =
+      let (condition,elements,rest) = parseIf text
+      in IfElement condition elements : parser  rest
+  |parseBTxt text =
+      let (txt,rest) = parseTxt text
+      in TextElement txt : parser  rest
+  |otherwise = []
 
-variableParser :: Parser TemplateElement
-variableParser = do
-  string "{{"
-  variableName <- many1 (noneOf "}")
-  string "}}"
-  return (VariableElement variableName)
-  
-ifParser :: Parser TemplateElement
-ifParser = do
-  string "{% if "
-  condition <- many1 (noneOf " %}")
-  string "%}"
-  
-  elements <- templateParser
-  string "{% endif %}"
-  return (IfElement condition elements)
+parseTxt :: String -> (String,String)
+parseTxt ('{':'*':res) =
+  case break (== '*') res of
+    (txt,'*':'}':rest) -> (txt,rest)
+    (_, _) -> error "Invalid pattern"
 
-loopParser :: Parser TemplateElement
-loopParser = do
-  string "{% for "
-  variableName <- many1 (noneOf " in ")
-  string " in "
-  listName <- many1 (noneOf " %}")
-  string " %}"
-  elements <- templateParser
-  string "{% endfor %}"
-  return (LoopElement variableName elements)
+parseIf:: String -> (String,String,String)
+parseIf('{':'%':' ':'i':'f':'-':x:res) =
+  case break (== '%') res of
+    (condition,'%':'}':rest) ->
+      let (elements,resto) = parseEndIf x rest
+      in (condition,elements,resto)
+    (_,_) -> error "Invalid pattern"
 
-textParser :: Parser TemplateElement
-textParser = do
-  string "{*"
-  text <- many1 (noneOf "*}")
-  string "*}"
-  return (TextElement text)
+parseVar :: String -> (String,String)
+parseVar ('{':'{':res) =
+  case break (== '}') res of
+    (var,'}':'}':rest) -> (var,rest)
+    (_, _) -> error "Invalid pattern"
+
+parseEndIf::Char -> String -> (String,String)
+parseEndIf x str =
+  let flag = "{% endif-"++[x]++" %}"
+  in case splitStr flag str of
+    (elements,'{':'%':' ':'e':'n':'d':'i':'f':'-':x:' ':'%':'}':rest) -> (elements,rest)
+    (_,_)->("error","error")
+
+splitStr :: String -> String -> (String,String)
+splitStr subst str =
+  let
+    index = findSubstrIndex subst str 0
+    (element,rest) = splitAt index str
+  in
+    (element,rest)
+
+findSubstrIndex :: String -> String -> Int -> Int
+findSubstrIndex (x:xs) []  index = -1
+findSubstrIndex [] (y:ys) index = -1
+findSubstrIndex (x:xs) (y:ys) index
+  | x == y =  if(subst (x:xs) (y:ys))
+                then
+                  index
+              else
+                findSubstrIndex (x:xs) ys (index+1)
+  |otherwise = findSubstrIndex (x:xs) ys (index+1)
+
+subst :: String -> String -> Bool
+subst (x:xs) [] = False
+subst [x] (y:ys) = x == y
+subst (x:xs) (y:ys) =
+  (x == y) && subst xs ys
+
+parseBTxt :: String -> Bool
+parseBTxt ('{':'*':_) = True
+parseBTxt _ = False
+
+parseBIf :: String -> Bool
+parseBIf ('{':'%':' ':'i':'f':'-':_) = True
+parseBIf _ = False
+
+parseBVar :: String -> Bool
+parseBVar ('{':'{':_) = True
+parseBVar _ = False
 
 -- Genera el contenido final reemplazando las variables con sus valores
-generateContent :: [(String, String)] -> [TemplateElement] -> String
+generateContent :: [(String, String)] -> Template -> String
 generateContent _ [] = ""
 
 generateContent variables (TextElement text : xs) = text ++ generateContent variables xs
@@ -59,18 +111,22 @@ generateContent variables (VariableElement name : xs) =
 generateContent variables (IfElement condition elements : xs) =
   case evaluateCondition condition variables of
     Just value -> if value
-                  then generateContent variables elements ++ generateContent variables xs
+                  then
+                    let elem = parser elements
+                    in generateContent variables elem ++ generateContent variables xs
                   else generateContent variables xs
     Nothing -> generateContent variables xs
 
 -- Evalúa una condición
 evaluateCondition :: String -> [(String, String)] -> Maybe Bool
-evaluateCondition condition variables =
-  let replacedCondition = replaceVariables condition variables
-  in case parseExp replacedCondition of
-    Left err -> Nothing
-    Right expr -> evalExp expr
-
+evaluateCondition condition variables
+  | replacedCondition == "True " = Just True
+  | replacedCondition == "False " = Just False
+  | otherwise =
+       case parseExp replacedCondition of
+        Left err -> Nothing
+        Right expr -> evalExp expr
+  where replacedCondition = replaceVariables condition variables
 -- Divide una lista separada por comas en elementos individuales
 splitList :: String -> [String]
 splitList = words . map (\c -> if c == ',' then ' ' else c)
@@ -79,7 +135,7 @@ splitList = words . map (\c -> if c == ',' then ' ' else c)
 replaceVariables :: String -> [(String,String)] -> String
 replaceVariables str [] = str
 replaceVariables str ((var,val):dict) =
-  let splList= splitSpace str 
+  let splList= splitSpace str
       replacedStr = replace splList var val
   in replaceVariables replacedStr dict
 
@@ -98,19 +154,18 @@ replace [] _ _ = ""
 replace (x:xs) var value
         |x == var = value ++ " " ++ replace xs var value
         |otherwise = x ++ " " ++ replace xs var value
-          
-    
+
+
 -- Ejemplo de uso
 main :: IO ()
 main = do
-  let template = "{% if edad > 18 %}{*Hola*}{% endif %}{*El texto pincha y las variables*}{{Var}}"
+  let template = "{% if-1 pincha %}{* Hola los if pinchan *}{% if-2 edad > 18 %}{* Eres Mayor de Edad *}{% endif-2 %}{% endif-1 %}{*El texto pincha y las variables*}{{Var}}"
     -- \n{% for item in lista %}\n- {{item}}\n{% endfor %}"
-  let variables = [("Var", "Tambien"),("edad", "22")]
-  case parse templateParser "" template of
-    Right parsedTemplate -> do
-      let content = generateContent variables parsedTemplate
-      writeFile "output.html" content
-      putStrLn "Archivo generado correctamente."
-    Left err -> putStrLn $ "Error al analizar la plantilla: " ++ show err
+  let
+    variables = [("Var","Tambien"),("pincha","True"),("edad","19")]
+    parsedTemplate = parser template
+    content = generateContent variables parsedTemplate
+  writeFile "output.html" content
+  putStrLn "Archivo generado correctamente."
 
 
