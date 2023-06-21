@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Redundant bracket" #-}
 import Text.ParserCombinators.Parsec
 import ParserExpresion (parseExp,evalExp)
 import Control.Arrow (Arrow(first))
@@ -11,27 +13,66 @@ import Data.Maybe (maybeToList)
 import Distribution.Simple.InstallDirs (substituteInstallDirTemplates)
 import Data.Array.IArray (Ix(index))
 import Data.ByteString (split)
+import Distribution.TestSuite (TestInstance(name))
+import Text.XHtml (variable)
+import GHC.Exts.Heap (GenClosure(var))
 
 data TemplateElement =
     TextElement String
     |VariableElement String
     |IfElement String String
+    |LoopElement String [String] String
     deriving (Eq,Show)
 
 type Template = [TemplateElement]
 -- Parser Template Element
-parser ::String -> Template
-parser  text
+parser ::String -> [(String,String)] -> Template
+parser  text variable
   |parseBVar text =
       let (var,rest) = parseVar text
-      in VariableElement var : parser  rest
+      in VariableElement var : parser  rest variable
   |parseBIf text =
       let (condition,elements,rest) = parseIf text
-      in IfElement condition elements : parser  rest
+      in IfElement condition elements : parser  rest variable
   |parseBTxt text =
       let (txt,rest) = parseTxt text
-      in TextElement txt : parser  rest
+      in TextElement txt : parser  rest variable
+  |parseBFor text =
+      let (nameItem,listItem,elements,rest) = parseFor text  
+      in case lookup listItem variable  of 
+          Just list -> 
+            let spltlist = splitList list
+            in LoopElement nameItem spltlist elements : parser  rest variable
+          Nothing -> 
+           let lista = splitList listItem
+           in LoopElement nameItem lista elements : parser  rest variable  
   |otherwise = []
+
+
+
+
+
+parseFor :: String -> (String,String,String,String)
+parseFor('{':'%':' ':'f':'o':'r':'-':x:res) =
+  case splitStr "in" res of
+    (nameItem,'i':'n':rest) ->
+      case break (== '%') rest of
+          (listItem,'%':'}':nrest) ->
+            let (elements,resto) = parseEndFor x nrest
+            in (trim nameItem,trim listItem,elements,resto)
+          (_,_) -> error "Invalid pattern"
+
+parseBFor :: String -> Bool
+parseBFor ('{':'%':' ':'f':'o':'r':'-':_) = True
+parseBFor _ = False
+
+parseEndFor::Char -> String -> (String,String)
+parseEndFor x str =
+  let flag = "{% endfor-"++[x]++" %}"
+  in case splitStr flag str of
+    (elements,'{':'%':' ':'e':'n':'d':'f':'o':'r':'-':x:' ':'%':'}':rest) -> (elements,rest)
+    (_,_)->("error","error")
+
 
 parseTxt :: String -> (String,String)
 parseTxt ('{':'*':res) =
@@ -112,10 +153,37 @@ generateContent variables (IfElement condition elements : xs) =
   case evaluateCondition condition variables of
     Just value -> if value
                   then
-                    let elem = parser elements
+                    let elem = parser elements variables
                     in generateContent variables elem ++ generateContent variables xs
                   else generateContent variables xs
     Nothing -> generateContent variables xs
+
+generateContent variables ((LoopElement key (value:list) elements):xs)
+  | null list = generateContent variables xs
+  | otherwise =
+    let 
+      newVar = addDict (key,value) variables
+      elem = parser elements variables
+    in  generateContent newVar elem ++ generateContent variables ((LoopElement key list elements):xs)
+
+test :: [(String, String)] -> [TemplateElement] -> String
+test  variables ((LoopElement key (value:list) elements):xs)
+  | null list = generateContent variables xs
+  | otherwise =
+    let 
+      newVar = addDict (key,value) variables
+      elem = parser elements variables
+    in  generateContent newVar elem ++ test variables ((LoopElement key list elements):xs)
+
+
+addDict:: (String,String) -> [(String,String)] -> [(String,String)]
+addDict (key,value) [] = [(key,value)]
+addDict (keyItem,valueItem) ((key,value):xs) =
+  if(key == keyItem) 
+    then
+      ((keyItem,valueItem):xs)
+  else 
+    (key,value):addDict (keyItem,valueItem) xs
 
 -- Evalúa una condición
 evaluateCondition :: String -> [(String, String)] -> Maybe Bool
@@ -155,16 +223,17 @@ replace (x:xs) var value
         |x == var = value ++ " " ++ replace xs var value
         |otherwise = x ++ " " ++ replace xs var value
 
+trim :: String -> String
+trim = unwords . words
 
 -- Ejemplo de uso
 main :: IO ()
 main = do
-  let template = "{% if-1 pincha %}{* Hola los if pinchan *}{% if-2 edad > 18 %}{* Eres Mayor de Edad *}{% endif-2 %}{% endif-1 %}{*El texto pincha y las variables*}{{Var}}"
-    -- \n{% for item in lista %}\n- {{item}}\n{% endfor %}"
+  let template = "{% if-1 pincha %}{* Hola los if pinchan *}{% if-2 edad > 18 %}{* Eres Mayor de Edad *}{% endif-2 %}{% endif-1 %}{*El texto pincha y las variables*}{{ Var }}{% for-1 item in lista %}{{item}}{% for-2 item in lista2 %}{* Hola *}{% endfor-2 %}{% endfor-1 %}"
   let
-    variables = [("Var","Tambien"),("pincha","True"),("edad","19")]
-    parsedTemplate = parser template
-    content = generateContent variables parsedTemplate
+    variables = [("Var","Tambien"),("pincha","True"),("edad","19"),("lista","1,2,3,4,5,6,7,8"),("lista2","1,2,3,4,5,6,7,8")]
+    parsedTemplate = parser template variables
+    content = generateContent variables parsedTemplate 
   writeFile "output.html" content
   putStrLn "Archivo generado correctamente."
 
